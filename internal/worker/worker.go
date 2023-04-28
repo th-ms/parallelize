@@ -3,16 +3,17 @@ package worker
 
 import (
 	"context"
-	"github.com/rs/zerolog"
-	"github.com/rs/zerolog/log"
 	"go/ast"
 	"go/printer"
 	"go/token"
 	"go/types"
-	"golang.org/x/tools/go/ast/astutil"
-	"golang.org/x/tools/go/packages"
 	"os"
 	"strings"
+
+	"github.com/rs/zerolog"
+	"github.com/rs/zerolog/log"
+	"golang.org/x/tools/go/ast/astutil"
+	"golang.org/x/tools/go/packages"
 )
 
 // Worker is a terrible generic loaded term for this. This struct holds the necessary information
@@ -66,7 +67,10 @@ func (w Worker) processTestFile(ctx context.Context, fast *ast.File) {
 			if ok := w.maybeParallelizeRunCall(ctx, fdecl); !ok {
 				fdecl.Body.List = prependParallelCall(fdecl.Body.List)
 				lg.Trace().Msg("t.Parallel call added to simple test body")
+				return true
 			}
+			// Parallelizing test tables can lead to some issues, let's fix them
+			w.fixTestTables(ctx, fdecl)
 		}
 		return true
 	})
@@ -109,15 +113,14 @@ func (w Worker) isTestFunc(ctx context.Context, fdecl *ast.FuncDecl) bool {
 func (w Worker) maybeParallelizeRunCall(ctx context.Context, fdecl *ast.FuncDecl) bool {
 	lg := log.Ctx(ctx)
 
-	lg.Trace().Msgf("Checking for t.Run calls")
+	lg.Trace().Msg("Checking for t.Run calls")
 	var parallelized bool
 	astutil.Apply(fdecl, func(c *astutil.Cursor) bool {
 		if c.Node() == nil {
-			lg.Trace().Msg("Skipping nil node")
 			return false
 		}
 
-		truncall, ok := w.isTestingRunCall(ctx, c.Node())
+		truncall, ok := w.isTestingRunCall(c.Node())
 		if !ok {
 			return true
 		}
@@ -137,46 +140,112 @@ func (w Worker) maybeParallelizeRunCall(ctx context.Context, fdecl *ast.FuncDecl
 
 		// for this sub-tree, we already found t.Run
 		// we are not supporting nested t.Runs
-		// NOTE: hopefully, this (i.e. returning false) does what we think it does
+		// NOTE: hopefully, returning false here does what we think it does
 		return false
 	}, nil)
 
 	return parallelized
 }
 
-func (w Worker) isTestingRunCall(ctx context.Context, node ast.Node) (*ast.CallExpr, bool) {
+func (w Worker) fixTestTables(ctx context.Context, fdecl *ast.FuncDecl) bool {
 	lg := log.Ctx(ctx)
 
+	lg.Trace().Msg("Checking for test table")
+	lg.Trace().Msg("Checking for 'tests' var declaration")
+	stmts := fdecl.Body.List
+	hasTestsVar := false
+	for _, stmt := range stmts {
+		astmt, ok := stmt.(*ast.AssignStmt)
+		if !ok {
+			continue
+		}
+		if len(astmt.Lhs) != 1 {
+			continue
+		}
+		ident, ok := astmt.Lhs[0].(*ast.Ident)
+		if !ok {
+			continue
+		}
+		if ident.Name != "tests" {
+			continue
+		}
+		hasTestsVar = true
+	}
+	if !hasTestsVar {
+		lg.Trace().Msg("No 'tests' variable found. Quitting...")
+		return false
+	}
+
+	lg.Trace().Msg("Checking for table test loop")
+	for _, stmt := range stmts {
+		rstmt, ok := stmt.(*ast.RangeStmt)
+		if !ok {
+			continue
+		}
+		ident, ok := rstmt.X.(*ast.Ident)
+		if !ok {
+			continue
+		}
+
+		if ident.Name != "tests" {
+			continue
+		}
+
+		for _, stmt := range rstmt.Body.List {
+			_, ok := w.isTestingRunCall(stmt)
+			if !ok {
+				continue
+			}
+
+			lg.Trace().Msg("Found loop for table test")
+			// Pin tt variable
+			// See: https://gist.github.com/posener/92a55c4cd441fc5e5e85f27bca008721
+			rstmt.Body.List = append([]ast.Stmt{&ast.AssignStmt{
+				Lhs: []ast.Expr{
+					&ast.Ident{
+						Name: "tt",
+					},
+				},
+				Rhs: []ast.Expr{
+					&ast.Ident{
+						Name: "tt",
+					},
+				},
+				Tok: token.DEFINE,
+			}}, rstmt.Body.List...)
+		}
+
+	}
+
+	return false
+}
+
+func (w Worker) isTestingRunCall(node ast.Node) (*ast.CallExpr, bool) {
 	stmt, ok := node.(ast.Stmt)
 	if !ok {
-		lg.Trace().Msgf("Node skipped: Node %q is not an *ast.Stmt", w.fset.Position(node.Pos()))
 		return nil, false
 	}
 
 	estmt, ok := stmt.(*ast.ExprStmt)
 	if !ok {
-		lg.Trace().Msgf("Node skipped: Statement %q is not an *ast.ExprStmt", w.fset.Position(stmt.Pos()))
 		return nil, false
 	}
 	cexpr, ok := estmt.X.(*ast.CallExpr)
 	if !ok {
-		lg.Trace().Msgf("Node skipped: Expression statement does not point to an *ast.CallExpr", w.fset.Position(estmt.X.Pos()))
 		return nil, false
 	}
 	fexpr, ok := cexpr.Fun.(*ast.SelectorExpr)
 	if !ok {
-		lg.Fatal().Msgf("I didn't know this could happen: Call expression function is not a *ast.SelectorExpr", w.fset.Position(cexpr.Fun.Pos()))
+		return nil, false
 	}
 	xident, ok := fexpr.X.(*ast.Ident)
 	if !ok {
-		lg.Trace().Msgf("I didn't know this could happen: Function expression does not point to an identifier", w.fset.Position(fexpr.X.Pos()))
+		return nil, false
 	}
 	if xident.Name != "t" {
-		lg.Trace().Msgf("Node skipped: Function expression identifier name is %q, expected 't'", xident.Name)
 		return nil, false
 	}
 	if fexpr.Sel.Name != "Run" {
-		lg.Trace().Msgf("Node skipped: Function selector identifier name is %q, expected 'Run'", fexpr.Sel.Name)
 		return nil, false
 	}
 
